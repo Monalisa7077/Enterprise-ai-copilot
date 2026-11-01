@@ -9,6 +9,7 @@ describe('environment configuration', () => {
     expect(settings.CHUNK_OVERLAP).toBe(200);
     expect(settings.EMBEDDING_PROVIDER).toBe('openai');
     expect(settings.EMBEDDING_MODEL).toBe('text-embedding-3-small');
+    expect(settings.GEMINI_GENERATION_MODEL).toBe('gemini-3.5-flash');
   });
 
   it('selects a Gemini model by default when Gemini is configured', () => {
@@ -48,5 +49,10 @@ describe('environment configuration', () => {
   it('rejects an explicitly empty provider key', () => {
     expect(() => envSchema.parse({ OPENAI_API_KEY: '' })).toThrow();
     expect(() => envSchema.parse({ GEMINI_API_KEY: '' })).toThrow();
+  });
+
+  it('rejects an empty Gemini generation model', () => {
+    expect(() => envSchema.parse({ GEMINI_GENERATION_MODEL: '' })).toThrow();
+    expect(() => envSchema.parse({ GEMINI_GENERATION_MODEL: '  ' })).toThrow();
   });
 });

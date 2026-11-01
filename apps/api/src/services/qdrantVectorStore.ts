@@ -20,6 +20,19 @@ export interface DocumentVectorScope {
   ownerId: string;
 }
 
+export interface VectorSearchScope {
+  workspaceId: string;
+  ownerId: string;
+}
+
+export interface VectorSearchResult {
+  text: string;
+  documentId: string;
+  chunkIndex: number;
+  pageNumbers?: number[];
+  score: number;
+}
+
 export type VectorStoreErrorCode =
   | 'INVALID_CONFIGURATION'
   | 'UNSUPPORTED_MODEL'
@@ -29,7 +42,9 @@ export type VectorStoreErrorCode =
   | 'COLLECTION_NOT_READY'
   | 'INVALID_VECTOR'
   | 'INVALID_METADATA'
+  | 'INVALID_TOP_K'
   | 'UPSERT_FAILED'
+  | 'SEARCH_FAILED'
   | 'DELETE_FAILED';
 
 const vectorStoreErrorMessages: Record<VectorStoreErrorCode, string> = {
@@ -41,9 +56,14 @@ const vectorStoreErrorMessages: Record<VectorStoreErrorCode, string> = {
   COLLECTION_NOT_READY: 'Vector collection is not ready for writes',
   INVALID_VECTOR: 'Vector data does not match the configured collection dimensions',
   INVALID_METADATA: 'Chunk metadata is invalid',
+  INVALID_TOP_K: 'Search result limit is invalid',
   UPSERT_FAILED: 'Could not store document vectors',
+  SEARCH_FAILED: 'Could not search document vectors',
   DELETE_FAILED: 'Could not delete document vectors',
 };
+
+const defaultSearchTopK = 5;
+const maximumSearchTopK = 100;
 
 export class VectorStoreError extends Error {
   constructor(readonly code: VectorStoreErrorCode) {
@@ -70,6 +90,15 @@ export interface QdrantVectorClient {
       filter: Schemas['Filter'];
     },
   ): Promise<Schemas['UpdateResult']>;
+  search(
+    collectionName: string,
+    operation: {
+      vector: number[];
+      limit: number;
+      filter: Schemas['Filter'];
+      with_payload: boolean;
+    },
+  ): Promise<Schemas['ScoredPoint'][]>;
 }
 
 function collectionNameFor(config: VectorStoreConfig): string {
@@ -114,6 +143,45 @@ function validateScope(scope: DocumentVectorScope): void {
   ) {
     throw new VectorStoreError('INVALID_METADATA');
   }
+}
+
+function validateSearchScope(scope: VectorSearchScope): void {
+  if (
+    !scope ||
+    typeof scope.workspaceId !== 'string' ||
+    !scope.workspaceId.trim() ||
+    typeof scope.ownerId !== 'string' ||
+    !scope.ownerId.trim()
+  ) {
+    throw new VectorStoreError('INVALID_METADATA');
+  }
+}
+
+function searchResultFromPoint(point: Schemas['ScoredPoint']): VectorSearchResult {
+  const payload = point.payload;
+  if (
+    !isRecord(payload) ||
+    typeof payload.text !== 'string' ||
+    !payload.text.trim() ||
+    typeof payload.documentId !== 'string' ||
+    !payload.documentId.trim() ||
+    !Number.isInteger(payload.chunkIndex) ||
+    (payload.chunkIndex as number) < 0 ||
+    !Number.isFinite(point.score) ||
+    (payload.pageNumbers !== undefined &&
+      (!Array.isArray(payload.pageNumbers) ||
+        payload.pageNumbers.some((pageNumber) => !Number.isInteger(pageNumber) || pageNumber < 1)))
+  ) {
+    throw new VectorStoreError('INVALID_METADATA');
+  }
+
+  return {
+    text: payload.text,
+    documentId: payload.documentId,
+    chunkIndex: payload.chunkIndex as number,
+    ...(payload.pageNumbers === undefined ? {} : { pageNumbers: payload.pageNumbers as number[] }),
+    score: point.score,
+  };
 }
 
 function pointId(documentId: string, chunkIndex: number): string {
@@ -299,6 +367,48 @@ export class QdrantVectorStore {
     } catch {
       throw new VectorStoreError('UPSERT_FAILED');
     }
+  }
+
+  async searchChunks(
+    queryVector: readonly number[],
+    scope: VectorSearchScope,
+    topK = defaultSearchTopK,
+  ): Promise<VectorSearchResult[]> {
+    validateSearchScope(scope);
+    if (
+      !Number.isInteger(topK) ||
+      topK < 1 ||
+      topK > maximumSearchTopK
+    ) {
+      throw new VectorStoreError('INVALID_TOP_K');
+    }
+    if (
+      !Array.isArray(queryVector) ||
+      queryVector.length !== this.config.dimensions ||
+      queryVector.some((value) => typeof value !== 'number' || !Number.isFinite(value))
+    ) {
+      throw new VectorStoreError('INVALID_VECTOR');
+    }
+
+    await this.ensureCollection();
+    let points: Schemas['ScoredPoint'][];
+    try {
+      points = await this.client.search(this.collectionName, {
+        vector: [...queryVector],
+        limit: topK,
+        filter: {
+          must: [
+            { key: 'ownerId', match: { value: scope.ownerId } },
+            { key: 'workspaceId', match: { value: scope.workspaceId } },
+          ],
+        },
+        with_payload: true,
+      });
+    } catch {
+      throw new VectorStoreError('SEARCH_FAILED');
+    }
+
+    return points.map(searchResultFromPoint);
   }
 
   async deleteDocumentPoints(scope: DocumentVectorScope): Promise<void> {

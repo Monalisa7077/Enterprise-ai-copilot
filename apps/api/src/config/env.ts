@@ -17,6 +17,7 @@ export const envSchema = z
     CHUNK_OVERLAP: z.coerce.number().int().nonnegative().default(200),
     EMBEDDING_PROVIDER: z.enum(['openai', 'gemini']).default('openai'),
     EMBEDDING_MODEL: z.string().min(1).optional(),
+    GEMINI_GENERATION_MODEL: z.string().trim().min(1).default('gemini-3.5-flash'),
     OPENAI_API_KEY: z.string().min(1).optional(),
     GEMINI_API_KEY: z.string().min(1).optional(),
     QDRANT_URL: z.string().url().default('http://localhost:6333'),

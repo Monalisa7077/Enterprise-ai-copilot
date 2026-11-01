@@ -26,6 +26,7 @@ function makeClient(options: {
   collectionExists?: boolean;
   existingSize?: number;
   existingDistance?: string;
+  searchResults?: Schemas['ScoredPoint'][];
 } = {}) {
   let exists = options.collectionExists ?? false;
   const createCollection = vi.fn(
@@ -52,12 +53,24 @@ function makeClient(options: {
       _operation: { wait: boolean; filter: Schemas['Filter'] },
     ) => ({ status: 'completed' as const }),
   );
+  const search = vi.fn(
+    async (
+      _collectionName: string,
+      _operation: {
+        vector: number[];
+        limit: number;
+        filter: Schemas['Filter'];
+        with_payload: boolean;
+      },
+    ) => options.searchResults ?? [],
+  );
   const client = {
     getCollections,
     getCollection,
     createCollection,
     upsert,
     delete: deletePoints,
+    search,
   };
 
   return { client: client as unknown as QdrantVectorClient, mocks: client };
@@ -190,6 +203,80 @@ describe('Qdrant vector store', () => {
 
     expect(store.collectionName).toBe('knowledge_chunks_gemini_gemini_embedding_2_3072');
     expect(store.config.dimensions).toBe(3072);
+  });
+
+  it('searches the configured collection with owner and workspace filters and returns chunk sources', async () => {
+    const { client, mocks } = makeClient({
+      searchResults: [
+        {
+          id: 'point-1',
+          version: 1,
+          score: 0.92,
+          payload: {
+            text: 'Relevant chunk text.',
+            documentId: 'doc-123',
+            chunkIndex: 2,
+            pageNumbers: [3],
+          },
+        },
+      ],
+    });
+    const store = new QdrantVectorStore(client, openAiConfig);
+
+    await expect(
+      store.searchChunks(validVectors[0], { ownerId: 'owner-789', workspaceId: 'workspace-456' }, 7),
+    ).resolves.toEqual([
+      {
+        text: 'Relevant chunk text.',
+        documentId: 'doc-123',
+        chunkIndex: 2,
+        pageNumbers: [3],
+        score: 0.92,
+      },
+    ]);
+
+    expect(mocks.search).toHaveBeenCalledWith(store.collectionName, {
+      vector: validVectors[0],
+      limit: 7,
+      filter: {
+        must: [
+          { key: 'ownerId', match: { value: 'owner-789' } },
+          { key: 'workspaceId', match: { value: 'workspace-456' } },
+        ],
+      },
+      with_payload: true,
+    });
+  });
+
+  it('returns an empty list when the scoped search has no matches', async () => {
+    const { client, mocks } = makeClient({ searchResults: [] });
+    const store = new QdrantVectorStore(client, openAiConfig);
+
+    await expect(
+      store.searchChunks(validVectors[0], { ownerId: 'owner-789', workspaceId: 'workspace-456' }),
+    ).resolves.toEqual([]);
+    expect(mocks.search.mock.calls[0][1].limit).toBe(5);
+  });
+
+  it('rejects invalid search scopes, vectors, and topK values before searching', async () => {
+    const { client, mocks } = makeClient();
+    const store = new QdrantVectorStore(client, openAiConfig);
+    const scope = { ownerId: 'owner-789', workspaceId: 'workspace-456' };
+
+    await expect(store.searchChunks(validVectors[0], { ...scope, ownerId: '' })).rejects.toMatchObject({
+      code: 'INVALID_METADATA',
+    });
+    await expect(store.searchChunks(validVectors[0], { ...scope, workspaceId: '' })).rejects.toMatchObject({
+      code: 'INVALID_METADATA',
+    });
+    await expect(store.searchChunks([1], scope)).rejects.toMatchObject({ code: 'INVALID_VECTOR' });
+    await expect(store.searchChunks(validVectors[0], scope, 0)).rejects.toMatchObject({
+      code: 'INVALID_TOP_K',
+    });
+    await expect(store.searchChunks(validVectors[0], scope, 101)).rejects.toMatchObject({
+      code: 'INVALID_TOP_K',
+    });
+    expect(mocks.search).not.toHaveBeenCalled();
   });
 
   it('rejects vector count, dimension, non-finite values, and required metadata errors', async () => {
